@@ -1,224 +1,407 @@
-"""Correctness-gated benchmark for mojo-bezier-curves.
+"""Benchmarks against the upstream `bezier` package.
 
-Every case checks agreement with an independent NumPy reference before timing,
-so a regression in the Mojo kernels shows up as a correctness failure rather
-than a suspiciously good number. The upstream `bezier` package is not installed
-in this environment, so the baselines are the fastest reasonable NumPy
-formulations of the same mathematics -- vectorised over the parameter grid, not
-Python loops that NumPy would never be asked to run.
+Every case checks its answer against upstream before timing, so a fast wrong
+number cannot be reported as a win. Timing is the best of `REPEATS` runs after
+a warm-up, in the same process, with the upstream side timed first.
+
+Two kinds of case, answering different questions:
+
+  * **one curve** -- the same problem handed to both implementations once, so
+    the number is kernel arithmetic against kernel arithmetic. A loss here is a
+    loss.
+  * **a family** -- N curves against a loop of N upstream calls, because
+    upstream has no batched API and that is what the port adds. Those cases are
+    labelled `N calls` rather than pretending the comparison is like for like.
+
+Where upstream has a vectorised formulation available (`evaluate_multi`,
+`evaluate_multi_de_casteljau`) the baseline uses it. Where it does not (the
+scalar `evaluate_hodograph` and `get_curvature`), the baseline is the fastest
+vectorised NumPy expression of the same mathematics, built from upstream's own
+helpers, because timing upstream's scalar API in a Python loop would flatter the
+port.
+
+Run it through `pixi run bench`, never directly: that task holds a machine-wide
+flock so a concurrent factory job cannot distort the numbers.
 """
 
-from __future__ import annotations
-
-import math
-import pathlib
-import sys
+import platform
 import time
 
 import numpy as np
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "python"))
+import bezier
+from bezier.hazmat import curve_helpers as up
 
-import mojo_bezier_curves as mbc  # noqa: E402
+import mojo_bezier_curves as mbc
+from mojo_bezier_curves import Curves, _lib
+from mojo_bezier_curves import curve_helpers as mine
+
+REPEATS = 5
+WARMUP = 1
 
 
-def _time(fn, repeats=3):
+def _family(count, dim, degree, seed=0):
+    rng = np.random.default_rng(seed)
+    return np.ascontiguousarray(rng.random((count, dim, degree + 1)))
+
+
+def _check(ours, theirs, label):
+    ours = np.asarray(ours)
+    theirs = np.asarray(theirs)
+    if ours.shape != theirs.shape:
+        raise AssertionError(
+            f"{label}: shape {ours.shape} != upstream {theirs.shape}"
+        )
+    scale = max(float(np.max(np.abs(theirs))), 1.0)
+    error = float(np.max(np.abs(ours - theirs))) / scale
+    if not error < 1e-9:
+        raise AssertionError(f"{label}: relative error {error:.3e}")
+
+
+def _time(function):
+    for _ in range(WARMUP):
+        function()
     best = float("inf")
-    for _ in range(repeats):
-        t0 = time.perf_counter()
-        fn()
-        best = min(best, time.perf_counter() - t0)
+    for _ in range(REPEATS):
+        start = time.perf_counter()
+        function()
+        best = min(best, time.perf_counter() - start)
     return best
 
 
-def bernstein_weights(degree: int, s_vals: np.ndarray) -> np.ndarray:
-    """The Bernstein basis matrix, built with exact integer binomials."""
-    grid = np.asarray(s_vals, dtype=np.float64)
-    return np.array(
-        [
-            [math.comb(degree, j) * (1.0 - t) ** (degree - j) * t**j for t in grid]
-            for j in range(degree + 1)
-        ]
+def _loop(function, count):
+    return lambda: [function(index) for index in range(count)]
+
+
+def _upstream_hodograph(nodes, values):
+    """Upstream's mathematics, vectorised: `n * evaluate_multi(differences, s)`."""
+    first_deriv = nodes[:, 1:] - nodes[:, :-1]
+    return (nodes.shape[1] - 1) * up.evaluate_multi(first_deriv, values)
+
+
+def _upstream_curvature(nodes, values):
+    """Upstream's mathematics, vectorised over the parameter grid."""
+    num_nodes = nodes.shape[1]
+    first_deriv = nodes[:, 1:] - nodes[:, :-1]
+    second_deriv = first_deriv[:, 1:] - first_deriv[:, :-1]
+    tangent = _upstream_hodograph(nodes, values)
+    concavity = (num_nodes - 1) * (num_nodes - 2) * up.evaluate_multi(
+        second_deriv, values
+    )
+    speed = np.linalg.norm(tangent, axis=0)
+    return (tangent[0] * concavity[1] - tangent[1] * concavity[0]) / speed**3
+
+
+# --------------------------------------------------------------------------
+# cases
+# --------------------------------------------------------------------------
+
+
+def case_evaluate_one_curve():
+    nodes = np.asfortranarray(_family(1, 2, 8, seed=1)[0])
+    values = np.linspace(0.0, 1.0, 65536)
+    ours = lambda: mine.evaluate_multi(nodes, values)
+    theirs = lambda: up.evaluate_multi(nodes, values)
+    _check(ours(), theirs(), "evaluate one curve")
+    return "evaluate, 1 curve x 65536 s (deg 8)", ours, theirs
+
+
+def case_evaluate_family():
+    nodes = _family(256, 2, 8, seed=2)
+    values = np.linspace(0.0, 1.0, 2048)
+    family = Curves(nodes)
+    ours = lambda: family.evaluate_multi(values)
+    theirs = _loop(lambda i: up.evaluate_multi(nodes[i], values), 256)
+    result = ours()
+    for index in (0, 128, 255):
+        _check(result[index], up.evaluate_multi(nodes[index], values), "evaluate")
+    return "evaluate, 256 curves x 2048 s (deg 8), 1 call vs 256", ours, theirs
+
+
+def case_evaluate_de_casteljau_family():
+    nodes = _family(64, 2, 10, seed=3)
+    values = np.linspace(0.0, 1.0, 4096)
+    ours = lambda: _lib.evaluate_multi_de_casteljau(nodes, 1.0 - values, values)
+    theirs = _loop(
+        lambda i: up.evaluate_multi_de_casteljau(nodes[i], 1.0 - values, values), 64
+    )
+    _check(
+        ours()[0],
+        up.evaluate_multi_de_casteljau(nodes[0], 1.0 - values, values),
+        "de casteljau",
+    )
+    return (
+        "evaluate (de Casteljau), 64 curves x 4096 s (deg 10), 1 call vs 64",
+        ours,
+        theirs,
     )
 
 
-def numpy_evaluate(nodes: np.ndarray, weights: np.ndarray) -> np.ndarray:
-    return nodes @ weights
+def case_hodograph_family():
+    nodes = _family(64, 2, 8, seed=7)
+    values = np.linspace(0.0, 1.0, 4096)
+    family = Curves(nodes)
+    ours = lambda: family.evaluate_hodograph(values)
+    theirs = _loop(lambda i: _upstream_hodograph(nodes[i], values), 64)
+    for index in (0, 63):
+        _check(ours()[index], _upstream_hodograph(nodes[index], values), "hodograph")
+    return "hodograph, 64 curves x 4096 s (deg 8), 1 call vs 64", ours, theirs
 
 
-def numpy_subdivide(nodes: np.ndarray):
-    degree = nodes.shape[1] - 1
-    triangle = np.array(nodes, dtype=np.float64)
-    left = [triangle[:, 0]]
-    right = [triangle[:, degree]]
-    for k in range(1, degree + 1):
-        triangle = 0.5 * (triangle[:, :-1] + triangle[:, 1:])
-        left.append(triangle[:, 0])
-        right.append(triangle[:, -1])
-    return np.array(left).T, np.array(right[::-1]).T
+def case_curvature_family():
+    nodes = _family(64, 2, 8, seed=8)
+    values = np.linspace(0.0, 1.0, 4096)
+    family = Curves(nodes)
+    ours = lambda: family.get_curvature(values)
+    theirs = _loop(lambda i: _upstream_curvature(nodes[i], values), 64)
+    for index in (0, 63):
+        _check(ours()[index], _upstream_curvature(nodes[index], values), "curvature")
+    return "curvature, 64 curves x 4096 s (deg 8), 1 call vs 64", ours, theirs
 
 
-def monotone_family(count, degree, seed=0):
-    """Curves whose first coordinate is the parameter: Newton converges on these.
+def case_newton_refine_family():
+    nodes = _family(64, 2, 8, seed=9)
+    values = np.linspace(0.0, 1.0, 1024)
+    # One Newton step from 0.5 towards a point within an eighth of the parameter
+    # away: a well-conditioned refinement, which is what the kernel is for.
+    # Aiming at an arbitrary point on the curve makes the step chaotic and the
+    # two implementations would legitimately disagree in the last digits.
+    points = np.ascontiguousarray(
+        Curves(nodes).evaluate_multi(0.5 + 0.25 * (values - 0.5)).transpose(0, 2, 1)
+    )
+    starts = np.full((64, values.size), 0.5)
+    family = Curves(nodes)
+    ours = lambda: family.newton_refine(points, starts)
+    theirs = _loop(
+        lambda i: np.array(
+            [
+                # Upstream wants the point as a (dimension, 1) column; handing
+                # it a flat vector broadcasts to (dimension, dimension) and
+                # quietly computes a different step.
+                up.newton_refine(
+                    nodes[i], points[i, k, :].reshape(-1, 1), starts[i, k]
+                )
+                for k in range(values.size)
+            ]
+        ),
+        64,
+    )
+    result = ours()
+    for index in (0, 63):
+        for k in (0, 500, 1023):
+            expected = up.newton_refine(
+                nodes[index], points[index, k, :].reshape(-1, 1), 0.5
+            )
+            assert abs(result[index, k] - expected) <= 1e-12 * max(1.0, abs(expected))
+    return "newton refine, 64 curves x 1024 points (deg 8), 1 call vs 65536", ours, theirs
 
-    A randomly shaped cubic loops back on itself, and then `B(s) = p` has several
-    roots or none, which is a property of the curve rather than of the kernel.
+
+def case_subdivide_family():
+    nodes = _family(512, 2, 10, seed=4)
+    family = Curves(nodes)
+    ours = lambda: family.subdivide()
+    theirs = _loop(lambda i: up.subdivide_nodes(nodes[i]), 512)
+    left, right = ours()
+    for index in (0, 511):
+        their_left, their_right = up.subdivide_nodes(nodes[index])
+        _check(left.nodes[index], their_left, "subdivide left")
+        _check(right.nodes[index], their_right, "subdivide right")
+    return "subdivide, 512 curves (deg 10), 1 call vs 512", ours, theirs
+
+
+def case_specialize_family():
+    nodes = _family(512, 2, 10, seed=5)
+    family = Curves(nodes)
+    ours = lambda: family.specialize(0.25, 0.75)
+    theirs = _loop(lambda i: up.specialize_curve(nodes[i], 0.25, 0.75), 512)
+    _check(ours()[3].nodes, up.specialize_curve(nodes[3], 0.25, 0.75), "specialize")
+    return "specialize, 512 curves (deg 10), 1 call vs 512", ours, theirs
+
+
+def case_elevate_family():
+    nodes = _family(4096, 2, 8, seed=6)
+    family = Curves(nodes)
+    ours = lambda: family.elevate()
+    theirs = _loop(lambda i: up.elevate_nodes(nodes[i]), 4096)
+    _check(ours()[17].nodes, up.elevate_nodes(nodes[17]), "elevate")
+    return "elevate, 4096 curves (deg 8), 1 call vs 4096", ours, theirs
+
+
+def case_length_family():
+    nodes = _family(64, 2, 6, seed=10)
+    family = Curves(nodes)
+    ours = lambda: family.length(panels=4096)
+    theirs = _loop(lambda i: up.compute_length(nodes[i]), 64)
+    result = ours()
+    for index in (0, 63):
+        _check(result[index], up.compute_length(nodes[index]), "length")
+    return "length, 64 curves (deg 6), 1 call vs 64", ours, theirs
+
+
+def case_curve_objects():
+    """The drop-in path: one `Curve` object per curve, upstream against ours."""
+    count = 2048
+    nodes = _family(count, 2, 6, seed=11)
+    values = np.linspace(0.0, 1.0, 256)
+    ours_curves = [mbc.Curve(nodes[i], 6) for i in range(count)]
+    their_curves = [bezier.Curve(nodes[i], degree=6) for i in range(count)]
+    ours = lambda: [curve.evaluate_multi(values) for curve in ours_curves]
+    theirs = lambda: [curve.evaluate_multi(values) for curve in their_curves]
+    _check(ours()[3], theirs()[3], "Curve objects")
+    return "evaluate via Curve objects, 2048 x 256 s (deg 6)", ours, theirs
+
+
+def case_pure_python_helpers():
+    """The same drop-in path, but against upstream's *Python* helpers.
+
+    `bezier.Curve` dispatches to a compiled Cython backend, so the row above
+    compares a compiled object against a ctypes call. This row compares like
+    with like -- upstream's pure Python `curve_helpers.evaluate_multi` against
+    this port's -- and is the honest measure of the per-call path.
     """
-    rng = np.random.default_rng(seed)
-    x = np.tile(np.linspace(0.0, 1.0, degree + 1), (count, 1))
-    j = np.arange(degree + 1)[np.newaxis, :]
-    phase = 0.3 + 1.4 * rng.random((count, 1))
-    y = ((j + phase) / (degree + phase)) ** 2
-    return np.stack([x, y], axis=1)
+    count = 2048
+    nodes = _family(count, 2, 6, seed=12)
+    values = np.linspace(0.0, 1.0, 256)
+    ours_nodes = [np.asfortranarray(curve) for curve in nodes]
+    ours = lambda: [mine.evaluate_multi(curve, values) for curve in ours_nodes]
+    theirs = lambda: [
+        up.evaluate_multi(curve, values) for curve in ours_nodes
+    ]
+    _check(ours()[3], theirs()[3], "pure python helpers")
+    return "evaluate via curve_helpers (pure Python), 2048 x 256 s", ours, theirs
 
 
-def family(count, dim, degree, seed=0):
-    rng = np.random.default_rng(seed)
-    return rng.standard_normal((count, dim, degree + 1))
+#: Output counts for the device threshold sweep: (curves, s values) with a
+#: degree-8 curve, so `curves * 2 * s` is the number of outputs the kernel
+#: decides on.
+DEVICE_SIZES = [
+    (1, 131072),
+    (8, 8192),
+    (32, 8192),
+    (256, 2048),
+    (1024, 8192),
+]
+
+#: Below this the kernel never launches, so a device run cannot be timed.
+GPU_MIN_OUTPUTS = 1 << 17
 
 
-def bench_evaluate(count=256, dim=2, degree=8, num_s=2048):
-    grid = np.linspace(0.0, 1.0, num_s)
-    weights = bernstein_weights(degree, grid)
-    nodes = family(count, dim, degree, seed=1)
-    curves = mbc.Curves(nodes)
+def device_sweep():
+    """The device path against the host SIMD path: same batch, same arithmetic.
 
-    expected = np.stack([numpy_evaluate(curve, weights) for curve in nodes])
-    got = curves.evaluate_multi(grid)
-    assert np.allclose(got, expected, rtol=1e-11, atol=1e-12), "evaluate mismatch"
+    `bc_evaluate_multi_s` is the entry point that decides between the two and
+    reports which it took; `bc_evaluate_multi_vs` is the host path on its own,
+    handed the `1 - s` grid the kernel would otherwise form in registers. Same
+    recurrence, so the results are compared exactly and only the time is at
+    stake. Returns `None` when no device took a batch, which is what the
+    library is built to answer to.
+    """
+    rows = []
+    for curves, s_vals in DEVICE_SIZES:
+        nodes = _family(curves, 2, 8, seed=21)
+        values = np.linspace(0.0, 1.0, s_vals)
+        # Held in a name, never inlined into `_addr(...)`: a temporary is
+        # released as soon as the inner call returns, so the kernel would go on
+        # to read an address whose array is already freed.
+        complement = 1.0 - values
+        batch = _lib.Batch(nodes)
+        size = curves * 2 * s_vals
+        spare = batch.degree + 1
 
-    def reference():
-        return np.stack([numpy_evaluate(curve, weights) for curve in nodes])
+        def device():
+            buffer = np.empty(size + spare, dtype=np.float64)
+            used = _lib.lib.bc_evaluate_multi_s(
+                _lib._addr(nodes), _lib._addr(values), curves, 2, batch.degree,
+                s_vals, _lib._addr(buffer),
+            )
+            return buffer, bool(used)
 
-    label = f"evaluate {count} curves x {num_s} s (deg {degree})"
-    return label, _time(reference), _time(lambda: curves.evaluate_multi(grid))
+        def host():
+            buffer = np.empty(size + spare, dtype=np.float64)
+            _lib.lib.bc_evaluate_multi_vs(
+                batch.address, _lib._addr(complement), _lib._addr(values),
+                curves, 2, batch.degree, s_vals, _lib._addr(buffer),
+            )
+            return buffer
 
-
-def bench_evaluate_single(num_s=65536, degree=12):
-    grid = np.linspace(0.0, 1.0, num_s)
-    weights = bernstein_weights(degree, grid)
-    nodes = family(1, 2, degree, seed=2)[0]
-    curve = mbc.Curve(nodes)
-    got = curve.evaluate_multi(grid)
-    assert np.allclose(got, numpy_evaluate(nodes, weights), rtol=1e-11, atol=1e-12)
-
-    label = f"evaluate one curve x {num_s} s (deg {degree})"
-    return label, _time(lambda: numpy_evaluate(nodes, weights)), _time(
-        lambda: curve.evaluate_multi(grid)
-    )
-
-
-def bench_subdivide(count=512, dim=2, degree=10):
-    nodes = family(count, dim, degree, seed=3)
-    curves = mbc.Curves(nodes)
-    left, right = curves.subdivide()
-    for index in (0, count // 2, count - 1):
-        expect_left, expect_right = numpy_subdivide(nodes[index])
-        assert np.allclose(left[index].nodes, expect_left, rtol=1e-14, atol=0.0)
-        assert np.allclose(right[index].nodes, expect_right, rtol=1e-14, atol=0.0)
-
-    def reference():
-        return [numpy_subdivide(curve) for curve in nodes]
-
-    label = f"subdivide {count} curves (deg {degree})"
-    return label, _time(reference), _time(lambda: curves.subdivide())
-
-
-def bench_elevate(count=4096, dim=2, degree=8):
-    nodes = family(count, dim, degree, seed=4)
-    curves = mbc.Curves(nodes)
-    got = curves.elevate()
-    for index in (0, count // 3, count - 1):
-        width = degree + 1
-        expected = np.empty((dim, width + 1))
-        expected[:, 0] = nodes[index][:, 0]
-        expected[:, -1] = nodes[index][:, -1]
-        for j in range(1, width):
-            expected[:, j] = (
-                j * nodes[index][:, j - 1] + (width - j) * nodes[index][:, j]
-            ) / width
-        assert np.allclose(got[index].nodes, expected, rtol=1e-13, atol=0.0)
-
-    def reference():
-        out = np.empty((count, dim, degree + 2))
-        out[:, :, 0] = nodes[:, :, 0]
-        out[:, :, -1] = nodes[:, :, -1]
-        for j in range(1, degree + 1):
-            out[:, :, j] = (
-                j * nodes[:, :, j - 1] + (degree + 1 - j) * nodes[:, :, j]
-            ) / (degree + 1)
-        return out
-
-    label = f"elevate {count} curves (deg {degree})"
-    return label, _time(reference), _time(lambda: curves.elevate())
+        device_result, used = device()
+        if size < GPU_MIN_OUTPUTS:
+            rows.append((size, curves, s_vals, None, _time(host)))
+            continue
+        if not used:
+            return None
+        # Only the result itself: the host path also writes the VS binomial row
+        # into the spare doubles past it, and the device path does not.
+        np.testing.assert_array_equal(device_result[:size], host()[:size])
+        rows.append((size, curves, s_vals, _time(device), _time(host)))
+    return rows
 
 
-def bench_newton(count=64, degree=6, num_points=4096):
-    nodes = monotone_family(count, degree, seed=5)
-    curves = mbc.Curves(nodes)
-    grid = np.linspace(0.0, 1.0, num_points)
-    points = np.ascontiguousarray(curves.evaluate_multi(grid).transpose(0, 2, 1))
-    # Start near the answer, the way Curve.locate does after bisection.
-    starts = np.broadcast_to(np.clip(grid - 0.05, 0.0, 1.0), (count, num_points)).copy()
-    refined = mbc._lib.newton_refine(curves.nodes, points, starts, 20)
-    residual = max(
-        float(np.abs(mbc.bernstein(nodes[b], refined[b]).T - points[b]).max())
-        for b in range(count)
-    )
-    assert residual < 1e-9, f"newton residual {residual}"
-
-    def reference():
-        s = starts.copy()
-        for _ in range(20):
-            delta = np.empty((count, num_points))
-            norm = np.empty((count, num_points))
-            for b in range(count):
-                degree_ = degree
-                first = degree_ * (nodes[b][:, 1:] - nodes[b][:, :-1])
-                second = degree_ * (nodes[b][:, 2:] - 2 * nodes[b][:, 1:-1]
-                                    + nodes[b][:, :-2])
-                batch = mbc.bernstein(nodes[b], s[b]).T
-                deriv = mbc.bernstein(first, s[b]).T
-                delta[b] = ((points[b] - batch) * deriv).sum(axis=1)
-                norm[b] = (deriv * deriv).sum(axis=1)
-            s = s + delta / norm
-        return s
-
-    label = f"newton {count} curves x {num_points} points"
-    return label, _time(reference, 2), _time(
-        lambda: mbc._lib.newton_refine(curves.nodes, points, starts, 20)
-    )
+def print_device_table():
+    """Print the device threshold sweep, or say why it did not run."""
+    rows = device_sweep()
+    print()
+    if rows is None:
+        print("no usable device on this box; every evaluation took the host path.")
+        return
+    print("| outputs (curves x s) | device | host SIMD | device/host |")
+    print("| ---: | ---: | ---: | ---: |")
+    for size, curves, s_vals, device_seconds, host_seconds in rows:
+        label = f"{size} ({curves} x {s_vals} s)"
+        if device_seconds is None:
+            print(
+                f"| {label} | not launched, under the {GPU_MIN_OUTPUTS} "
+                f"output threshold | {host_seconds * 1e3:.3f} ms | host only |"
+            )
+            continue
+        print(
+            f"| {label} | {device_seconds * 1e3:.3f} ms "
+            f"| {host_seconds * 1e3:.3f} ms "
+            f"| {device_seconds / host_seconds:.2f} |"
+        )
 
 
-def bench_length(count=64, degree=6, panels=4096):
-    nodes = family(count, 2, degree, seed=6)
-    curves = mbc.Curves(nodes)
-    got = curves.length(panels=panels)
-    degree_ = degree
-    forward = degree_ * (nodes[:, :, 1:] - nodes[:, :, :-1])
-    weights = bernstein_weights(degree_ - 1, np.linspace(0.0, 1.0, panels + 1))
-    speed = np.linalg.norm(forward @ weights, axis=1)
-    weights_simpson = np.ones(panels + 1)
-    weights_simpson[1:-1:2] = 4.0
-    weights_simpson[2:-1:2] = 2.0
-    expected = (speed @ weights_simpson) / (3.0 * panels)
-    assert np.allclose(got, expected, rtol=1e-12, atol=0.0), "length mismatch"
-
-    def reference():
-        return (speed @ weights_simpson) / (3.0 * panels)
-
-    label = f"length {count} curves, {panels} panels (deg {degree})"
-    return label, _time(reference), _time(lambda: curves.length(panels=panels))
+CASES = [
+    case_evaluate_one_curve,
+    case_evaluate_family,
+    case_evaluate_de_casteljau_family,
+    case_hodograph_family,
+    case_curvature_family,
+    case_newton_refine_family,
+    case_subdivide_family,
+    case_specialize_family,
+    case_elevate_family,
+    case_length_family,
+    case_curve_objects,
+    case_pure_python_helpers,
+]
 
 
 def main():
-    print(f"{'case':<42}{'numpy':>12}{'mojo-bezier-curves':>20}{'ratio':>9}")
-    print("-" * 83)
-    for fn in (bench_evaluate, bench_evaluate_single, bench_subdivide, bench_elevate,
-               bench_newton, bench_length):
-        label, reference, ours = fn()
-        ratio = reference / ours if ours else float("nan")
-        print(f"{label:<42}{reference * 1e3:>10.2f}ms{ours * 1e3:>18.2f}ms{ratio:>8.2f}x")
+    print("mojo-bezier-curves against upstream bezier\n")
+    print(f"python      {platform.python_version()} on {platform.machine()}")
+    print(f"numpy       {np.__version__}")
+    print(f"upstream    bezier {bezier.__version__}")
+    print(f"timing      best of {REPEATS} runs\n")
+    print("| case | upstream | mojo-bezier-curves | speedup |")
+    print("| --- | ---: | ---: | ---: |")
+    rows = []
+    for case in CASES:
+        label, ours, theirs = case()
+        upstream_seconds = _time(theirs)
+        ours_seconds = _time(ours)
+        ratio = upstream_seconds / ours_seconds
+        rows.append(ratio)
+        verdict = f"{ratio:.2f}x"
+        if ratio < 1.0:
+            verdict = f"**{ratio:.2f}x, slower**"
+        print(
+            f"| {label} | {upstream_seconds * 1e3:.2f} ms "
+            f"| {ours_seconds * 1e3:.2f} ms | {verdict} |"
+        )
+    wins = sum(1 for ratio in rows if ratio >= 1.0)
+    print(f"\n{wins} of {len(rows)} cases at or above upstream parity.")
+    print_device_table()
 
 
 if __name__ == "__main__":

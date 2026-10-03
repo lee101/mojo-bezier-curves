@@ -11,10 +11,20 @@ test = "python -m pytest tests -q"
 bench = "flock /tmp/mojo-bench.lock python bench/bench.py"
 
 [activation.env]
+PYTHONNOUSERSITE = "1"
 PYTHONPATH = "python"
 
 [dependencies]
-mojo = "==1.2.0.dev2026092605"
-python = "3.13.*"
+# `max` is the package the GPU host API lives in now (`max.gpu.host`), which
+# the large-batch evaluation path uses. It is released in lockstep with `mojo`.
+mojo = "==1.2.0.dev2026092905"
+max = "==26.7.0.dev2026092905"
+python = "3.12.*"
 pytest = "*"
 numpy = "*"
+scipy = "*"
+
+[pypi-dependencies]
+# The upstream package this port mirrors. It ships cp312 wheels, which is why
+# the environment is pinned to Python 3.12; its `compute_length` needs SciPy.
+bezier = "==2024.6.20"

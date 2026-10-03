@@ -1,274 +1,373 @@
-"""mojo-bezier-curves: Bezier curve evaluation, splitting and derivatives in Mojo.
+"""mojo-bezier-curves: Bezier curve evaluation in Mojo.
 
 A port of the compute core of the `bezier` package
-(https://pypi.org/project/bezier/): Bernstein evaluation by two independent
-algorithms, de Casteljau subdivision and interval restriction, degree
-elevation, the hodograph, signed curvature, Newton's method for point location,
-and arc length by composite Simpson.
+(https://github.com/dhermes/bezier, release 2024.6.20). :class:`Curve` has the
+names, argument order, defaults and return shapes of ``bezier.Curve`` for the
+covered subset, so it is a drop-in for those methods, and
+:mod:`mojo_bezier_curves.curve_helpers` has the names and signatures of
+``bezier.hazmat.curve_helpers``.
 
-The Python layer keeps the familiar ``(dimension, degree + 1)`` Fortran-order
-node layout that ``bezier.Curve`` uses, and adds a batched ``Curves`` family
-whose members share one parameter grid, which is where the compiled kernels pay
-off. Every array is owned here and handed to the kernel as a 64-bit address.
-
-The upstream package requires NumPy 2 and is not present in the parity test
-environment, so the tests here check the port against an independent NumPy
-transcription of the Bernstein definition and against analytic identities
-(endpoints, subdivision closure, degree-elevation invariance, circle curvature,
-straight-line length). See the README.
+:class:`Curves` is the addition: a family of curves that share a dimension, a
+degree and a parameter grid, which the compiled kernels are batched over.
+Upstream evaluates one curve per Python call, so a quadrature or a Newton
+refinement over a thousand curves costs a thousand calls here and one.
 """
 
 from __future__ import annotations
 
-import math
-
 import numpy as np
 
-from . import _lib
+from . import _lib, curve_helpers
+from .curve_helpers import (  # noqa: F401  (re-exported for the drop-in shape)
+    compute_length,
+    de_casteljau_one_round,
+    elevate_nodes,
+    evaluate_hodograph,
+    evaluate_multi,
+    evaluate_multi_barycentric,
+    evaluate_multi_de_casteljau,
+    evaluate_multi_vs,
+    get_curvature,
+    locate_point,
+    make_subdivision_matrices,
+    newton_refine,
+    specialize_curve,
+    subdivide_nodes,
+    vec_size,
+)
 
-__all__ = ["Curve", "Curves", "bernstein"]
+__version__ = "0.1.0"
+
+__all__ = [
+    "Curve",
+    "Curves",
+    "curve_helpers",
+    "make_subdivision_matrices",
+    "subdivide_nodes",
+    "evaluate_multi",
+    "evaluate_multi_vs",
+    "evaluate_multi_de_casteljau",
+    "evaluate_multi_barycentric",
+    "vec_size",
+    "compute_length",
+    "elevate_nodes",
+    "de_casteljau_one_round",
+    "specialize_curve",
+    "evaluate_hodograph",
+    "get_curvature",
+    "newton_refine",
+    "locate_point",
+]
+
+#: Panel count used by :attr:`Curve.length`, which upstream takes from QUADPACK.
+DEFAULT_LENGTH_PANELS = 1024
 
 
-_MAX_LOCATE_SUBDIVISIONS = 20
-
-
-def _for_nodes(nodes: np.ndarray) -> np.ndarray:
-    """A ``(dim, degree + 1)`` float64 array, as the `bezier` package stores."""
-    array = np.asfortranarray(np.asarray(nodes, dtype=np.float64))
+def _sequence_to_array(nodes) -> np.ndarray:
+    """A ``(dimension, num_nodes)`` float64 array, as ``bezier`` stores nodes."""
+    array = np.asarray(nodes, dtype=np.float64)
     if array.ndim != 2:
-        raise ValueError(
-            f"nodes must be (dimension, degree + 1), got rank {np.asarray(nodes).ndim}"
-        )
-    if array.shape[1] < 1:
-        raise ValueError("a curve needs at least one node")
+        raise ValueError(f"nodes must be 2D, got rank {array.ndim}")
+    if array.shape[0] < 1:
+        raise ValueError("a curve must live in at least one dimension")
     if not np.isfinite(array).all():
         raise ValueError("nodes must be finite")
     return array
 
 
 class Curve:
-    """A single Bezier curve, shaped like ``bezier.Curve`` for the covered subset."""
+    """A single Bezier curve.
 
-    __slots__ = ("_nodes",)
+    Args:
+        nodes (Sequence[Sequence[numbers.Number]]): The nodes of the curve, as
+            a ``(dimension, degree + 1)`` array.
+        degree (int): The degree of the curve.
+        copy (bool): Whether to copy ``nodes`` before storing it.
+        verify (bool): Whether to check that the node count matches `degree`.
 
-    def __init__(self, nodes, degree: int | None = None, copy: bool = True):
-        array = np.asarray(nodes)
-        if degree is not None and array.shape[-1] - 1 != degree:
-            raise ValueError(
-                f"expected degree {degree} for {array.shape[-1]} nodes"
-            )
-        self._nodes = _for_nodes(np.array(array, order="F", copy=copy) if copy
-                                 else np.asfortranarray(array))
+    Raises:
+        ValueError: If ``nodes`` is not 2D, if the node count does not match
+            `degree`, or if the nodes are not finite.
+    """
+
+    __slots__ = ("_batch", "_degree", "_dimension", "_nodes")
+
+    def __init__(self, nodes, degree: int, *, copy: bool = True, verify: bool = True):
+        array = _sequence_to_array(nodes)
+        self._dimension = array.shape[0]
+        self._nodes = array.copy(order="F") if copy else array
+        self._degree = int(degree)
+        if verify:
+            self._verify_degree()
+        # The kernels read a C-contiguous batch by address. Resolving it here,
+        # once, is what keeps a call down to the kernel: `as_batch` and
+        # `int(array.ctypes.data)` are per-call work on an array that never
+        # changes, and on this path they cost more than the evaluation.
+        self._batch = _lib.Batch(self._nodes[np.newaxis])
 
     @classmethod
     def from_nodes(cls, nodes, copy: bool = True) -> "Curve":
-        """Build a curve from its nodes, taking the degree from their count."""
-        return cls(nodes, copy=copy)
+        """Create a :class:`.Curve` from nodes, taking the degree from them."""
+        array = _sequence_to_array(nodes)
+        _, num_nodes = array.shape
+        return cls(array, num_nodes - 1, copy=copy, verify=False)
+
+    def _verify_degree(self) -> None:
+        num_nodes = self._nodes.shape[1]
+        expected_nodes = self._degree + 1
+        if num_nodes != expected_nodes:
+            raise ValueError(
+                f"A degree {self._degree} curve should have "
+                f"{expected_nodes} nodes, not {num_nodes}."
+            )
 
     @property
     def nodes(self) -> np.ndarray:
+        """numpy.ndarray: The nodes of the curve."""
         return self._nodes.copy(order="F")
 
     @property
     def degree(self) -> int:
-        return self._nodes.shape[1] - 1
+        """int: The degree of the curve."""
+        return self._degree
 
     @property
     def dimension(self) -> int:
-        return self._nodes.shape[0]
+        """int: The dimension the curve lives in."""
+        return self._dimension
+
+    @property
+    def length(self) -> float:
+        """float: The length of the curve."""
+        return curve_helpers.compute_length(
+            self._nodes, panels=DEFAULT_LENGTH_PANELS
+        )
+
+    def copy(self) -> "Curve":
+        """Copy of the current curve."""
+        return Curve(self._nodes, self._degree, copy=True, verify=False)
 
     def __repr__(self) -> str:
-        return f"Curve(dim={self.dimension}, degree={self.degree})"
+        return f"<Curve (degree={self._degree}, dimension={self._dimension})>"
 
     def __eq__(self, other) -> bool:
         if not isinstance(other, Curve):
             return NotImplemented
-        return self._nodes.shape == other._nodes.shape and bool(
-            np.array_equal(self._nodes, other._nodes)
+        return (
+            self._degree == other._degree
+            and self._dimension == other._dimension
+            and bool(np.array_equal(self._nodes, other._nodes))
         )
 
-    # -- evaluation ------------------------------------------------------
+    def _evaluate_grid(self, grid):
+        """`B(s)` for a continuous parameter grid, on the nodes held here.
 
-    def evaluate(self, s: float) -> np.ndarray:
-        """``B(s)`` as a ``(dimension, 1)`` array, as `bezier.Curve.evaluate`."""
-        return self.evaluate_multi(np.asfortranarray([s]))
+        The batch and its address come from construction, and `1 - grid` is
+        formed in the kernel, so an evaluation is the grid, the output buffer
+        and the call.
+        """
+        if self._degree + 1 > curve_helpers._VS_MAX_NODES:
+            return curve_helpers._column(
+                _lib.evaluate_multi_de_casteljau(self._nodes, 1.0 - grid, grid)
+            )
+        return curve_helpers._column(_lib.evaluate_multi_s(self._batch, grid))
 
-    def evaluate_multi(self, s_vals, de_casteljau: bool = False) -> np.ndarray:
-        """``B(s)`` for many ``s``, as a ``(dimension, num_s)`` array."""
-        grid = np.asfortranarray(np.atleast_1d(np.asarray(s_vals, dtype=np.float64)))
-        return _lib.evaluate_multi(self._nodes, grid, de_casteljau)[0].copy(order="F")
+    def evaluate(self, s):
+        r"""Evaluate :math:`B(s)` along the curve.
 
-    def hodograph(self, s_vals) -> np.ndarray:
-        """Tangent vectors ``B'(s)`` as a ``(dimension, num_s)`` array."""
-        if self.degree < 1:
-            raise ValueError("a curve of degree 0 has no tangent")
-        grid = np.asfortranarray(np.atleast_1d(np.asarray(s_vals, dtype=np.float64)))
-        return _lib.hodograph(self._nodes, grid)[0].copy(order="F")
+        Args:
+            s (float): Parameter along the curve.
 
-    # -- shape -----------------------------------------------------------
+        Returns:
+            numpy.ndarray: The point on the curve, as a ``(dimension, 1)``
+            array.
+        """
+        return self._evaluate_grid(np.ascontiguousarray([s], dtype=np.float64))
 
-    def subdivide(self) -> tuple["Curve", "Curve"]:
-        """Split into the ``s in [0, 1/2]`` and ``s in [1/2, 1]`` halves."""
-        left, right = _lib.subdivide(self._nodes)
-        return Curve(left[0], copy=False), Curve(right[0], copy=False)
+    def evaluate_multi(self, s_vals):
+        r"""Evaluate :math:`B(s)` for multiple points along the curve.
 
-    def restrict(self, t: float, from_end: bool = False) -> "Curve":
-        """The curve restricted to ``[0, t]`` (or ``[1 - t, 1]``)."""
-        return Curve(_lib.restrict(self._nodes, t, from_end)[0], copy=False)
+        Args:
+            s_vals (numpy.ndarray): Parameters along the curve, as a 1D array.
 
-    def specialize(self, start: float, end: float) -> "Curve":
-        """Re-parameterise ``[start, end]`` onto ``[0, 1]``."""
-        return Curve(_lib.specialize(self._nodes, start, end)[0], copy=False)
+        Returns:
+            numpy.ndarray: The points on the curve, columns for each ``s``
+            value and rows for the dimension.
+        """
+        return self._evaluate_grid(_lib._grid(s_vals))
+
+    def evaluate_hodograph(self, s):
+        r"""Evaluate the tangent vector :math:`B'(s)` along the curve.
+
+        Args:
+            s (float): Parameter along the curve.
+
+        Returns:
+            numpy.ndarray: The tangent vector, as a ``(dimension, 1)`` array.
+        """
+        return curve_helpers.evaluate_hodograph(s, self._nodes)
+
+    def subdivide(self):
+        r"""Split the curve into a left and a right half.
+
+        Returns:
+            Tuple[Curve, Curve]: The sub-curves on :math:`[0, 1/2]` and
+            :math:`[1/2, 1]`.
+        """
+        left_nodes, right_nodes = curve_helpers.subdivide_nodes(self._nodes)
+        left = Curve(left_nodes, self._degree, copy=False, verify=False)
+        right = Curve(right_nodes, self._degree, copy=False, verify=False)
+        return left, right
 
     def elevate(self) -> "Curve":
-        """A degree-elevated curve representing the same geometry."""
-        return Curve(_lib.elevate(self._nodes)[0], copy=False)
+        """Return a degree-elevated version of the current curve."""
+        new_nodes = curve_helpers.elevate_nodes(self._nodes)
+        return Curve(new_nodes, self._degree + 1, copy=False, verify=False)
 
-    # -- measurements ----------------------------------------------------
+    def specialize(self, start, end) -> "Curve":
+        """Specialize the curve to a sub-interval, re-parameterized to ``[0, 1]``.
 
-    def length(self, panels: int = 1024) -> float:
-        """Arc length; exact for lines, a composite Simpson sum otherwise."""
-        return float(_lib.length(self._nodes, panels)[0])
+        Args:
+            start (float): The start point of the interval we specialize to.
+            end (float): The end point of the interval we specialize to.
 
-    def curvature(self, s_vals) -> np.ndarray:
-        """Signed curvature of a planar curve, shape ``(num_s,)``."""
-        if self.dimension != 2:
-            raise ValueError("curvature is defined for planar curves only")
-        grid = np.asfortranarray(np.atleast_1d(np.asarray(s_vals, dtype=np.float64)))
-        return _lib.curvature(self._nodes, grid)[0]
-
-    def locate(self, point, max_subdivisions: int = _MAX_LOCATE_SUBDIVISIONS,
-               newton_iterations: int = 8):
-        """Find ``s`` with ``B(s) == point``, or ``None`` if off the curve.
-
-        Bisection over the control polygon's bounding box followed by Newton,
-        which is the strategy of `bezier.Curve.locate`: repeatedly halve and
-        keep the halves whose bounding box still contains the point, then
-        polish with the compiled Newton kernel.
+        Returns:
+            Curve: The newly specialized curve.
         """
-        target = np.asarray(point, dtype=np.float64).ravel()
-        if target.size != self.dimension:
-            raise ValueError("point has the wrong dimension")
-        candidates = [(0.0, 1.0, self._nodes)]
-        for _ in range(max_subdivisions + 1):
-            nxt = []
-            for start, end, candidate in candidates:
-                if not _contains(candidate, target):
-                    continue
-                midpoint = 0.5 * (start + end)
-                left, right = _lib.subdivide(candidate)
-                nxt.append((start, midpoint, left[0]))
-                nxt.append((midpoint, end, right[0]))
-            candidates = nxt
-        if not candidates:
-            return None
-        starts = np.array([0.5 * (lo + hi) for lo, hi, _ in candidates])
-        if starts.std() > 0.5**20:
-            raise ValueError("parameters not close enough to one another")
-        repeats = np.repeat(target[np.newaxis, np.newaxis, :], starts.size, axis=1)
-        refined = _lib.newton_refine(
-            self._nodes, repeats, starts[np.newaxis, :], newton_iterations
-        )[0]
-        # The mean of the candidate parameters must be in [0, 1], so the
-        # refined value can be pushed back into the unit interval safely.
-        return float(min(max(refined[0], 0.0), 1.0))
+        new_nodes = curve_helpers.specialize_curve(self._nodes, start, end)
+        return Curve(new_nodes, self._degree, copy=False, verify=False)
 
+    def locate(self, point):
+        r"""Find a point on the current curve, i.e. solve for :math:`B(s) = p`.
 
-def _contains(nodes: np.ndarray, point: np.ndarray) -> bool:
-    """Whether `point` lies inside the axis-aligned box of `nodes`."""
-    return bool(np.all(nodes.min(axis=1) <= point) and np.all(point <= nodes.max(axis=1)))
+        Args:
+            point (numpy.ndarray): The point to locate.
+
+        Returns:
+            Optional[float]: The parameter value, or :data:`None` if the point
+            is not on the curve.
+        """
+        return curve_helpers.locate_point(self._nodes, point)
 
 
 class Curves:
     """A family of curves sharing a dimension, a degree and a parameter grid.
 
     The compiled kernels are batched over this family, which is the reason they
-    exist: upstream evaluates one curve per Python call.
+    exist. Nodes are ``(curves, dimension, degree + 1)``; every method returns
+    the same result for each curve, in the same layout, from a single call.
     """
 
-    __slots__ = ("_nodes",)
+    __slots__ = ("_batch", "_nodes")
 
     def __init__(self, nodes, copy: bool = True):
         array = np.asarray(nodes, dtype=np.float64)
         if array.ndim == 2:
             array = array[np.newaxis, :, :]
         if array.ndim != 3:
-            raise ValueError("nodes must be (curves, dimension, degree + 1)")
-        self._nodes = np.ascontiguousarray(array) if copy else array
-        _lib.as_batch(self._nodes)
+            raise ValueError(
+                "nodes must be (curves, dimension, degree + 1), got rank "
+                f"{np.asarray(nodes).ndim}"
+            )
+        # Without the copy, an already contiguous array is adopted as it is;
+        # anything else still has to be laid out the way the kernel reads it.
+        # Either way the nodes came from a kernel or from this constructor,
+        # so the finiteness pass `as_batch` would make is redundant here.
+        self._batch = _lib.Batch(array) if copy else _lib.Batch.trusted(array)
+        self._nodes = self._batch.array
 
     @classmethod
     def from_nodes(cls, nodes) -> "Curves":
+        """Create a :class:`.Curves` family from a stacked node array."""
         return cls(nodes)
 
     @property
     def nodes(self) -> np.ndarray:
+        """numpy.ndarray: The nodes of every curve in the family."""
         return self._nodes.copy()
 
-
+    @property
+    def count(self) -> int:
+        """int: The number of curves in the family."""
+        return self._nodes.shape[0]
 
     @property
     def dimension(self) -> int:
+        """int: The dimension the curves live in."""
         return self._nodes.shape[1]
 
     @property
     def degree(self) -> int:
+        """int: The degree shared by the curves."""
         return self._nodes.shape[2] - 1
 
     def __len__(self) -> int:
         return self.count
 
     def __getitem__(self, index: int) -> Curve:
-        return Curve(self._nodes[index], copy=False)
+        return Curve(self._nodes[index], self.degree, copy=False, verify=False)
+
+    def __iter__(self):
+        for index in range(self.count):
+            yield self[index]
 
     def __repr__(self) -> str:
         return (
-            f"Curves(count={self.count}, dim={self.dimension}, degree={self.degree})"
+            f"Curves(count={self.count}, dimension={self.dimension}, "
+            f"degree={self.degree})"
         )
 
-    def evaluate_multi(self, s_vals, de_casteljau: bool = False) -> np.ndarray:
-        return _lib.evaluate_multi(self._nodes, s_vals, de_casteljau)
+    def _evaluate_barycentric(self, lambda1, lambda2):
+        """`evaluate_multi_barycentric` over the whole family, in one call."""
+        if self._nodes.shape[2] > curve_helpers._VS_MAX_NODES:
+            return _lib.evaluate_multi_de_casteljau(self._nodes, lambda1, lambda2)
+        return _lib.evaluate_multi_vs(self._batch, lambda1, lambda2)
 
-    def hodograph(self, s_vals) -> np.ndarray:
-        return _lib.hodograph(self._nodes, s_vals)
+    def _evaluate_grid(self, grid):
+        """`B(s)` over the whole family, in one call."""
+        if self._nodes.shape[2] > curve_helpers._VS_MAX_NODES:
+            return _lib.evaluate_multi_de_casteljau(self._nodes, 1.0 - grid, grid)
+        return _lib.evaluate_multi_s(self._batch, grid)
 
-    def subdivide(self) -> tuple["Curves", "Curves"]:
-        left, right = _lib.subdivide(self._nodes)
+    def evaluate(self, s):
+        """Evaluate every curve at one parameter, result ``(curves, dimension)``."""
+        return self._evaluate_grid(np.ascontiguousarray([s], dtype=np.float64))[
+            :, :, 0
+        ]
+
+    def evaluate_multi(self, s_vals):
+        """Evaluate every curve on a grid, result ``(curves, dimension, num_s)``."""
+        return self._evaluate_grid(
+            np.ascontiguousarray(s_vals, dtype=np.float64).ravel()
+        )
+
+    def evaluate_hodograph(self, s_vals):
+        """Tangent vectors for every curve, result ``(curves, dimension, num_s)``."""
+        return _lib.evaluate_hodograph(self._nodes, s_vals)
+
+    def subdivide(self):
+        """Split every curve in half, as two new families."""
+        left, right = _lib.subdivide_nodes(self._nodes)
         return Curves(left, copy=False), Curves(right, copy=False)
 
-    def restrict(self, t: float, from_end: bool = False) -> "Curves":
-        return Curves(_lib.restrict(self._nodes, t, from_end), copy=False)
-
-    def specialize(self, start: float, end: float) -> "Curves":
-        return Curves(_lib.specialize(self._nodes, start, end), copy=False)
-
     def elevate(self) -> "Curves":
-        return Curves(_lib.elevate(self._nodes), copy=False)
+        """Degree-elevate every curve."""
+        return Curves(_lib.elevate_nodes(self._nodes), copy=False)
 
-    def curvature(self, s_vals) -> np.ndarray:
-        return _lib.curvature(self._nodes, s_vals)
+    def specialize(self, start, end) -> "Curves":
+        """Re-parameterize every curve from ``[start, end]`` onto ``[0, 1]``."""
+        return Curves(_lib.specialize_curve(self._nodes, start, end), copy=False)
 
-    def length(self, panels: int = 1024) -> np.ndarray:
-        return _lib.length(self._nodes, panels)
+    def get_curvature(self, s_vals):
+        """Signed curvature of every planar curve, result ``(curves, num_s)``."""
+        grid = np.ascontiguousarray(s_vals, dtype=np.float64).ravel()
+        tangents = _lib.evaluate_hodograph(self._nodes, grid)
+        return _lib.get_curvature(self._nodes, tangents, grid)
 
+    def length(self, panels: int = DEFAULT_LENGTH_PANELS):
+        """Arc length of every curve, result ``(curves,)``."""
+        return _lib.compute_length(self._nodes, panels)
 
-def bernstein(nodes, s) -> np.ndarray:
-    """The Bernstein definition itself, written out longhand.
-
-    ``B(s) = sum_j C(n, j) (1 - s)^(n - j) s^j v_j``. This is the reference the
-    compiled recurrences are checked against: it shares no code with them, so a
-    mistake in the VS recurrence or in the de Casteljau triangle cannot hide
-    behind a matching mistake in the reference.
-    """
-    array = np.asarray(nodes, dtype=np.float64)
-    if array.ndim == 3:
-        return np.stack([bernstein(curve, s) for curve in array])
-    degree = array.shape[1] - 1
-    grid = np.atleast_1d(np.asarray(s, dtype=np.float64))
-    result = np.zeros((array.shape[0], grid.size), dtype=np.float64)
-    for j in range(degree + 1):
-        coefficient = np.array(
-            [math.comb(degree, j) * (1.0 - t) ** (degree - j) * t**j for t in grid]
-        )
-        result += array[:, j][:, np.newaxis] * coefficient[np.newaxis, :]
-    return result
+    def newton_refine(self, points, s_vals):
+        """One Newton step per (curve, point) pair, result shaped like `s_vals`."""
+        return _lib.newton_refine(self._nodes, points, s_vals)
