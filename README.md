@@ -237,18 +237,18 @@ earlier run.
 
 | case | upstream | mojo-bezier-curves | speedup |
 | --- | ---: | ---: | ---: |
-| evaluate, 1 curve x 65536 s (deg 8) | 5.94 ms | 0.97 ms | 6.10x |
-| evaluate, 256 curves x 2048 s (deg 8), 1 call vs 256 | 76.40 ms | 1.42 ms | 53.78x |
-| evaluate (de Casteljau), 64 curves x 4096 s (deg 10), 1 call vs 64 | 2800.80 ms | 26.24 ms | 106.72x |
-| hodograph, 64 curves x 4096 s (deg 8), 1 call vs 64 | 30.23 ms | 1.27 ms | 23.76x |
-| curvature, 64 curves x 4096 s (deg 8), 1 call vs 64 | 73.78 ms | 2.81 ms | 26.26x |
-| newton refine, 64 curves x 1024 points (deg 8), 1 call vs 65536 | 12812.93 ms | 5.17 ms | 2477.95x |
-| subdivide, 512 curves (deg 10), 1 call vs 512 | 23.32 ms | 0.20 ms | 117.17x |
-| specialize, 512 curves (deg 10), 1 call vs 512 | 159.16 ms | 0.37 ms | 426.65x |
-| elevate, 4096 curves (deg 8), 1 call vs 4096 | 48.66 ms | 0.22 ms | 216.58x |
-| length, 64 curves (deg 6), 1 call vs 64 | 1297.26 ms | 7.97 ms | 162.83x |
-| evaluate via Curve objects, 2048 x 256 s (deg 6) | 20.50 ms | 30.60 ms | **0.67x, slower** |
-| evaluate via curve_helpers (pure Python), 2048 x 256 s | 214.07 ms | 45.88 ms | 4.67x |
+| evaluate, 1 curve x 65536 s (deg 8) | 6.28 ms | 0.91 ms | 6.88x |
+| evaluate, 256 curves x 2048 s (deg 8), 1 call vs 256 | 77.79 ms | 1.19 ms | 65.50x |
+| evaluate (de Casteljau), 64 curves x 4096 s (deg 10), 1 call vs 64 | 2305.49 ms | 26.80 ms | 86.03x |
+| hodograph, 64 curves x 4096 s (deg 8), 1 call vs 64 | 28.50 ms | 1.31 ms | 21.76x |
+| curvature, 64 curves x 4096 s (deg 8), 1 call vs 64 | 69.53 ms | 2.88 ms | 24.18x |
+| newton refine, 64 curves x 1024 points (deg 8), 1 call vs 65536 | 11289.25 ms | 5.38 ms | 2100.05x |
+| subdivide, 512 curves (deg 10), 1 call vs 512 | 21.67 ms | 0.19 ms | 114.36x |
+| specialize, 512 curves (deg 10), 1 call vs 512 | 150.58 ms | 0.36 ms | 413.67x |
+| elevate, 4096 curves (deg 8), 1 call vs 4096 | 45.20 ms | 0.23 ms | 197.09x |
+| length, 64 curves (deg 6), 1 call vs 64 | 1199.19 ms | 7.85 ms | 152.71x |
+| evaluate via Curve objects, 2048 x 256 s (deg 6) | 20.39 ms | 27.44 ms | **0.74x, slower** |
+| evaluate via curve_helpers (pure Python), 2048 x 256 s | 187.84 ms | 39.14 ms | 4.80x |
 
 11 of 12 cases at or above upstream parity. The first two rows are the two the
 device path takes, and the two whose numbers depend on the box's other tenant.
@@ -291,16 +291,17 @@ the bench compares them exactly before it times either.
 
 | outputs (curves x s) | device | host SIMD | device/host |
 | ---: | ---: | ---: | ---: |
-| 262144 (1 x 131072 s) | 0.593 ms | 0.658 ms | 0.90 |
-| 131072 (8 x 8192 s) | 0.307 ms | 0.325 ms | 0.94 |
-| 524288 (32 x 8192 s) | 0.759 ms | 1.345 ms | 0.56 |
-| 1048576 (256 x 2048 s) | 1.277 ms | 2.712 ms | 0.47 |
-| 16777216 (1024 x 8192 s) | 107.137 ms | 113.592 ms | 0.94 |
+| 262144 (1 x 131072 s) | 0.638 ms | 0.638 ms | 1.00 |
+| 131072 (8 x 8192 s) | 0.336 ms | 0.342 ms | 0.98 |
+| 524288 (32 x 8192 s) | 0.688 ms | 1.420 ms | 0.48 |
+| 1048576 (256 x 2048 s) | 1.251 ms | 2.726 ms | 0.46 |
+| 16777216 (1024 x 8192 s) | 93.326 ms | 114.076 ms | 0.82 |
 
 A ratio below 1 means the device was faster. In this run it was ahead at every
-size, but only just at the smallest: 1.11x at 262144 outputs and 1.06x at
-131072, then 1.77x at 524288, 2.12x at 1048576 and 1.06x on the largest, where the
-copy in and out is a large enough share of the total that the advantage shrinks.
+size, but only just at the smallest: at 262144 outputs it was level with the host
+(1.00x), 1.02x at 131072, then 2.06x at 524288, 2.18x at 1048576 and 1.22x on the
+largest, where the copy in and out is a large enough share of the total that the
+advantage shrinks.
 Every device row moves by tens of percent between runs, because the GPU on this
 box is shared: across the five runs taken while writing this README the smallest
 batch ranged from 1.01x to 1.25x, and one put it level with the host.

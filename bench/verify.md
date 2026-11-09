@@ -1,14 +1,13 @@
-# Verify — mojo-bezier-curves vs upstream bezier 2024.6.20
+# Verify — mojo-bezier-curves vs upstream bezier 2024.6.20 (second session)
 
 Run in this session, in order, through `pixi run` (which holds the `flock`
 in `bench/bench.py`):
 
 1. `pixi run build && pixi run test` — green. 995 passed.
-2. `pixi run bench` — run 1 (saved to `/tmp/bench_verify_1.txt` at the time;
+2. `pixi run bench` — run 1 (saved to `/tmp/bench_verify_run1.txt` at the time;
    full output reproduced below).
 3. `pixi run bench` — run 2 (saved to `/tmp/bench_verify_2.txt`; full output
-   reproduced below), run to check whether the run-1 device-table deviation
-   was stable.
+   reproduced below), run to check whether run 1's deviations were stable.
 
 Both bench runs time upstream first, best of 5 after 1 warm-up, in one
 process, and every case asserts parity against upstream before timing
@@ -19,74 +18,81 @@ the device path engages).
 
 ## What reproduced (within 20%)
 
-All 12 rows of the README main table reproduce within 20% in both runs, on
-every column (upstream, port, and the derived speedup recomputed as
-upstream ÷ port from the measured columns). Run 1, the run the main table
-was corrected to:
+Main table, all 12 rows, run 1 (the run the main table was corrected to):
 
 | case | README (before) | measured (run 1) | max dev vs README |
-| --- | ---: | ---: | --- |
-| evaluate, 1 curve x 65536 s (deg 8) | 6.12 / 0.96 = 6.39x | 5.94 / 0.97 = 6.10x | 2.9% / 1.0% / 4.5% |
-| evaluate, 256 x 2048 (deg 8) | 85.50 / 1.62 = 52.64x | 76.40 / 1.42 = 53.78x | 10.6% / 12.3% / 2.2% |
-| evaluate (de Casteljau), 64 x 4096 (deg 10) | 2545.60 / 25.27 = 100.75x | 2800.80 / 26.24 = 106.72x | 10.0% / 3.8% / 5.9% |
-| hodograph, 64 x 4096 (deg 8) | 28.70 / 1.36 = 21.17x | 30.23 / 1.27 = 23.76x | 5.3% / 6.6% / 12.2% |
-| curvature, 64 x 4096 (deg 8) | 68.55 / 2.80 = 24.49x | 73.78 / 2.81 = 26.26x | 7.6% / 0.4% / 7.2% |
-| newton refine, 64 x 1024 (deg 8) | 11961.99 / 5.07 = 2359.77x | 12812.93 / 5.17 = 2477.95x | 7.1% / 2.0% / 5.0% |
-| subdivide, 512 (deg 10) | 23.13 / 0.22 = 104.85x | 23.32 / 0.20 = 117.17x | 0.8% / 9.1% / 11.8% |
-| specialize, 512 (deg 10) | 161.18 / 0.42 = 387.87x | 159.16 / 0.37 = 426.65x | 1.3% / 11.9% / 10.0% |
-| elevate, 4096 (deg 8) | 49.60 / 0.24 = 210.30x | 48.66 / 0.22 = 216.58x | 1.9% / 8.3% / 3.0% |
-| length, 64 (deg 6) | 1212.56 / 7.47 = 162.24x | 1297.26 / 7.97 = 162.83x | 7.0% / 6.7% / 0.4% |
-| evaluate via Curve objects, 2048 x 256 (deg 6) | 19.80 / 30.95 = **0.64x, slower** | 20.50 / 30.60 = **0.67x, slower** | 3.5% / 1.1% / 4.7% |
-| evaluate via curve_helpers (pure Python), 2048 x 256 | 208.13 / 46.45 = 4.48x | 214.07 / 45.88 = 4.67x | 2.9% / 1.2% / 4.2% |
+| --- | --- | --- | --- |
+| evaluate, 1 curve x 65536 s (deg 8) | 5.94 / 0.97 = 6.10x | 6.28 / 0.91 = 6.88x | 12.8% |
+| evaluate, 256 x 2048 (deg 8) | 76.40 / 1.42 = 53.78x | 77.79 / 1.19 = 65.50x | 21.8% (speedup column only) |
+| evaluate (de Casteljau), 64 x 4096 (deg 10) | 2800.80 / 26.24 = 106.72x | 2305.49 / 26.80 = 86.03x | 19.4% |
+| hodograph, 64 x 4096 (deg 8) | 30.23 / 1.27 = 23.76x | 28.50 / 1.31 = 21.76x | 8.4% |
+| curvature, 64 x 4096 (deg 8) | 73.78 / 2.81 = 26.26x | 69.53 / 2.88 = 24.18x | 7.9% |
+| newton refine, 64 x 1024 (deg 8) | 12812.93 / 5.17 = 2477.95x | 11289.25 / 5.38 = 2100.05x | 15.3% |
+| subdivide, 512 (deg 10) | 23.32 / 0.20 = 117.17x | 21.67 / 0.19 = 114.36x | 7.1% |
+| specialize, 512 (deg 10) | 159.16 / 0.37 = 426.65x | 150.58 / 0.36 = 413.67x | 5.4% |
+| elevate, 4096 (deg 8) | 48.66 / 0.22 = 216.58x | 45.20 / 0.23 = 197.09x | 9.0% |
+| length, 64 (deg 6) | 1297.26 / 7.97 = 162.83x | 1199.19 / 7.85 = 152.71x | 7.6% |
+| evaluate via Curve objects, 2048 x 256 (deg 6) | 20.50 / 30.60 = **0.67x, slower** | 20.39 / 27.44 = **0.74x, slower** | 10.4% |
+| evaluate via curve_helpers (pure Python), 2048 x 256 | 214.07 / 45.88 = 4.67x | 187.84 / 39.14 = 4.80x | 14.7% |
 
-Run 2 also stays within 20% of the pre-correction README on every column
-except two port-column cells that straddle the band (row 2 port: 22.2%
-below the README 1.62 ms; row 9 port: 20.8% below 0.24 ms) — both of which
-are the same shared-box noise the README already warns about
-("upstream's own numbers move by tens of percent between runs"). No row
-flips its win/loss verdict in either run: 11 of 12 at or above parity in
-both, row 11 slower in both.
+Deviation is computed per column as `|measured − README| / README`, with the
+speedup recomputed as upstream ÷ port from the measured columns. Exactly one
+cell in run 1 exceeds the 20% band: row 2's speedup column (65.50x vs 53.78x,
+21.8%). Both absolute columns of that row are within the band (1.8% and
+16.2%), so the row is a ratio of two in-band numbers landing just outside
+it — this is the row the README flags as device-path and tenant-dependent.
+Run 2 gives the same signal (66.10x, 22.9% out of band), so it is not a
+one-run artefact: the README's ratio for this row was low, and the corrected
+table carries the measured 65.50x. No row flips its win/loss verdict in
+either run: 11 of 12 at or above parity in both, the Curve-objects row
+slower in both (0.74x in run 1, 0.87x in run 2, against 0.67x in the README).
+
+Run 2 against the pre-correction README: every cell within 20% except row 2's
+speedup (22.9%) and row 11 (port column 25.6%, speedup 29.9% — the
+per-call-marshalling row, which is the noisiest per-call measurement; it
+reproduced within 10.4% in run 1). The ratio spread between the two runs
+for row 2 (65.50x vs 66.10x) is small; the row-2 upstream column moved
+77.79 → 87.47 ms, which is the shared-box "tens of percent" movement the
+README warns about.
 
 The one slower row (Curve objects) was left slower in the README: same
-wording, same `**…x, slower**` formatting, `0.64x` → `0.67x` only because
-the measured ratio is 0.67x. It was not removed and not reworded.
+wording, same `**…x, slower**` formatting, `0.67x` → `0.74x` only because
+the measured ratio is 0.74x. It was not removed and not reworded.
+
+The device table reproduced within 20% on every cell in run 1 (max dev
+14.3%, the 524288 ratio), and in run 2 on all but the largest device cell
+(80.477 vs 107.137 ms, 24.9% — the 16.8M-output copy-dominated row, the one
+most sensitive to the shared GPU). In run 1 the device was level with the
+host at the smallest size (ratio 1.00) rather than the README's 0.90; the
+corrected prose says so. The variance warning below the table is unchanged.
 
 ## What did not reproduce
 
-The "Where the device starts to pay" table did **not** reproduce in run 1.
-Device times were 143–573% above the README values at the three smallest
-sizes (4.544 ms vs 0.675 ms, 2.182 ms vs 0.363 ms, 2.120 ms vs 0.873 ms);
-the device was slower than the host at those sizes (ratios 6.01 / 5.81 /
-1.38 vs the claimed 0.89 / 0.99 / 0.61), while the host-SIMD column matched
-within 0.7–6.7% and the larger sizes matched within 18.3% / 4.4%.
-Run 2, a few minutes later on the same box with no code change, gave
-0.593 / 0.307 / 0.759 / 1.277 / 107.137 ms — within 12–27% of the README
-device column and again device-ahead at every size (0.90 / 0.94 / 0.56 /
-0.47 / 0.94). The README itself warns that every device row moves by tens
-of percent on this shared GPU and that the free-memory guard does not
-catch a busy-but-free device. Run 1 is that failure mode, measured.
+Nothing beyond the band items above. Every main-table figure was replaced
+with the run-1 measurement regardless, per the README's own "the output of
+one `pixi run bench`" provenance claim — a figure within 20% this time is
+still a figure from an earlier session's box state. The device table was
+replaced with the run-1 numbers for the same reason (run 1 and run 2 agree
+within 20% on all but the largest device cell, so run 1 is not an outlier
+this time and there was no reason to prefer run 2). The one correction
+beyond mechanical replacement: the device-table prose sentence (1.11x /
+1.06x / 1.77x / 2.12x / 1.06x) now reads from the new ratios (level at
+262144, 1.02x at 131072, 2.06x at 524288, 2.18x at 1048576, 1.22x at
+16777216).
 
 ## What was changed and why
 
-* **README main table**: every figure replaced with the run-1 measurement,
-  even though all figures were already within 20%. The rule is "a figure
-  that does not reproduce within 20% gets corrected"; the README also
-  states its tables are "the output of one `pixi run bench`", so leaving the
-  pre-session numbers would keep a false provenance claim even if they
-  happened to be within 20% this time. Nothing was invented: every new
-  figure is a number measured in this session. Row 11 stays slower.
-* **README device table**: replaced with the run-2 numbers (0.593 / 0.307 /
-  0.759 / 1.277 / 107.137 ms device, 0.658 / 0.325 / 1.345 / 2.712 /
-  113.592 ms host, ratios 0.90 / 0.94 / 0.56 / 0.47 / 0.94) and the prose
-  sentence corrected to match those ratios (1.11x / 1.06x / 1.77x / 2.12x /
-  1.06x). Run 2 was chosen because run 1's device column is the shared-GPU
-  outlier the README warns about, not the stable number; run 2 is the run
-  whose device numbers sit within the README's stated spread of its host
-  column. The pre-existing variance warning is unchanged.
+* **README main table**: every figure replaced with the run-1 measurement.
+  Nothing was invented: every new figure is a number measured in this
+  session. Row 11 stays slower, same wording.
+* **README device table + prose**: replaced with the run-1 numbers and the
+  prose corrected to match those ratios (1.00 / 0.98 / 0.48 / 0.46 / 0.82
+  device/host, i.e. level, 1.02x, 2.06x, 2.18x, 1.22x ahead). The
+  pre-existing variance warning is unchanged.
 * **No code changed.** The brief allows code changes only to fix a bug
   shown by a failing test. No test failed (995 passed) and no failing
   test identified a bug, so `src/`, `python/`, and `tests/` are untouched.
-  `bench/verify.md` is the only new file.
+  This file is the only new file.
 
 ## Same-input / no-skip-work audit (`bench/bench.py`)
 
@@ -94,7 +100,7 @@ Reading `bench/bench.py` case by case:
 
 * Every case builds its input once and hands the same object to both sides:
   `nodes` + `values` are constructed in the case function and captured by
-  both `ours` and `theirs` lambdas. Family cases loop upstream once per
+  both the `ours` and `theirs` lambdas. Family cases loop upstream once per
   curve (`_loop(…, 64/256/512/4096)`) which is exactly the work the
   unbatched upstream forces; the label says "1 call vs N" in the row name.
 * Every case asserts parity before timing: `case_evaluate_one_curve`,
@@ -127,7 +133,10 @@ Reading `bench/bench.py` case by case:
   README already flags `length` as a different amount of work, so this is
   disclosed, not hidden.
 
-No case skips work on one side.
+No case skips work on one side. The one upstream baseline that is not
+upstream's public API is the hodograph/curvature pair, which is disclosed in
+the docstring and is the hardest reasonable baseline (vectorised NumPy on
+upstream's own `evaluate_multi`, not a Python loop over the scalar API).
 
 ## Parity-test history
 
@@ -150,18 +159,21 @@ No case skips work on one side.
 * `4e157ac` (phase test): adds `tests/test_parity_extra.py` (460 lines),
   tightening coverage (barycentric, hodograph helper-to-helper, degenerate
   inputs). Adds assertions; removes none.
-* `3183e5e` (phase analyze): touches only `bench/analysis.md`, plus the
-  two `_lib.py` / `curve_helpers.py` fixes in the working tree (negative
-  degree guard; degree-0 `de_casteljau_one_round` empty result instead of
-  `ValueError`). No test file changed, no tolerance changed.
+* `3183e5e` (phase analyze): touches only `bench/analysis.md`. No test file
+  changed, no tolerance changed.
+* `e6bcc1a` (prior phase verify): touches only `README.md` and
+  `bench/verify.md`. No test file changed.
 
 `RTOL=1e-12, ATOL=1e-13` is identical at every commit that has a
-`conftest.py` (`54188bb`, `4e157ac`, `3183e5e`). No assertion was removed
-or loosened by an earlier phase that this phase needs to restore. The one
-former exact-equality check that changed (`batched vs per-curve
-evaluation`) was bit-equality, not parity-with-upstream, and is documented
-in the README as an FMA-rounding consequence; upstream parity is still
-`rtol=1e-12` there. Nothing restored because nothing was loosened.
+`conftest.py` (`54188bb`, `4e157ac`, `3183e5e`, `e6bcc1a`). `git diff
+54188bb..HEAD -- tests/` contains zero removed lines — only the 460 added
+lines of `test_parity_extra.py`. No assertion was removed or loosened by
+an earlier phase that this phase needed to restore; per the brief's rule
+(code changes only to fix a bug shown by a failing test), nothing was
+restored because nothing was loosened. The one former exact-equality check
+that changed (`batched vs per-curve evaluation`) was bit-equality, not
+parity-with-upstream, and is documented in the README as an FMA-rounding
+consequence; upstream parity is still `rtol=1e-12` there.
 
 ## Raw bench output, run 1 (main table source)
 
@@ -175,31 +187,31 @@ timing      best of 5 runs
 
 | case | upstream | mojo-bezier-curves | speedup |
 | --- | ---: | ---: | ---: |
-| evaluate, 1 curve x 65536 s (deg 8) | 5.94 ms | 0.97 ms | 6.10x |
-| evaluate, 256 curves x 2048 s (deg 8), 1 call vs 256 | 76.40 ms | 1.42 ms | 53.78x |
-| evaluate (de Casteljau), 64 curves x 4096 s (deg 10), 1 call vs 64 | 2800.80 ms | 26.24 ms | 106.72x |
-| hodograph, 64 curves x 4096 s (deg 8), 1 call vs 64 | 30.23 ms | 1.27 ms | 23.76x |
-| curvature, 64 curves x 4096 s (deg 8), 1 call vs 64 | 73.78 ms | 2.81 ms | 26.26x |
-| newton refine, 64 curves x 1024 points (deg 8), 1 call vs 65536 | 12812.93 ms | 5.17 ms | 2477.95x |
-| subdivide, 512 curves (deg 10), 1 call vs 512 | 23.32 ms | 0.20 ms | 117.17x |
-| specialize, 512 curves (deg 10), 1 call vs 512 | 159.16 ms | 0.37 ms | 426.65x |
-| elevate, 4096 curves (deg 8), 1 call vs 4096 | 48.66 ms | 0.22 ms | 216.58x |
-| length, 64 curves (deg 6), 1 call vs 64 | 1297.26 ms | 7.97 ms | 162.83x |
-| evaluate via Curve objects, 2048 x 256 s (deg 6) | 20.50 ms | 30.60 ms | **0.67x, slower** |
-| evaluate via curve_helpers (pure Python), 2048 x 256 s | 214.07 ms | 45.88 ms | 4.67x |
+| evaluate, 1 curve x 65536 s (deg 8) | 6.28 ms | 0.91 ms | 6.88x |
+| evaluate, 256 curves x 2048 s (deg 8), 1 call vs 256 | 77.79 ms | 1.19 ms | 65.50x |
+| evaluate (de Casteljau), 64 curves x 4096 s (deg 10), 1 call vs 64 | 2305.49 ms | 26.80 ms | 86.03x |
+| hodograph, 64 curves x 4096 s (deg 8), 1 call vs 64 | 28.50 ms | 1.31 ms | 21.76x |
+| curvature, 64 curves x 4096 s (deg 8), 1 call vs 64 | 69.53 ms | 2.88 ms | 24.18x |
+| newton refine, 64 curves x 1024 points (deg 8), 1 call vs 65536 | 11289.25 ms | 5.38 ms | 2100.05x |
+| subdivide, 512 curves (deg 10), 1 call vs 512 | 21.67 ms | 0.19 ms | 114.36x |
+| specialize, 512 curves (deg 10), 1 call vs 512 | 150.58 ms | 0.36 ms | 413.67x |
+| elevate, 4096 curves (deg 8), 1 call vs 4096 | 45.20 ms | 0.23 ms | 197.09x |
+| length, 64 curves (deg 6), 1 call vs 64 | 1199.19 ms | 7.85 ms | 152.71x |
+| evaluate via Curve objects, 2048 x 256 s (deg 6) | 20.39 ms | 27.44 ms | **0.74x, slower** |
+| evaluate via curve_helpers (pure Python), 2048 x 256 s | 187.84 ms | 39.14 ms | 4.80x |
 
 11 of 12 cases at or above upstream parity.
 
 | outputs (curves x s) | device | host SIMD | device/host |
 | ---: | ---: | ---: | ---: |
-| 262144 (1 x 131072 s) | 4.544 ms | 0.757 ms | 6.01 |
-| 131072 (8 x 8192 s) | 2.182 ms | 0.376 ms | 5.81 |
-| 524288 (32 x 8192 s) | 2.120 ms | 1.540 ms | 1.38 |
-| 1048576 (256 x 2048 s) | 2.082 ms | 2.992 ms | 0.70 |
-| 16777216 (1024 x 8192 s) | 65.557 ms | 88.032 ms | 0.74 |
+| 262144 (1 x 131072 s) | 0.638 ms | 0.638 ms | 1.00 |
+| 131072 (8 x 8192 s) | 0.336 ms | 0.342 ms | 0.98 |
+| 524288 (32 x 8192 s) | 0.688 ms | 1.420 ms | 0.48 |
+| 1048576 (256 x 2048 s) | 1.251 ms | 2.726 ms | 0.46 |
+| 16777216 (1024 x 8192 s) | 93.326 ms | 114.076 ms | 0.82 |
 ```
 
-## Raw bench output, run 2 (device table source)
+## Raw bench output, run 2 (reproducibility check)
 
 ```
 mojo-bezier-curves against upstream bezier
@@ -211,28 +223,28 @@ timing      best of 5 runs
 
 | case | upstream | mojo-bezier-curves | speedup |
 | --- | ---: | ---: | ---: |
-| evaluate, 1 curve x 65536 s (deg 8) | 5.75 ms | 0.93 ms | 6.16x |
-| evaluate, 256 curves x 2048 s (deg 8), 1 call vs 256 | 72.51 ms | 1.26 ms | 57.58x |
-| evaluate (de Casteljau), 64 curves x 4096 s (deg 10), 1 call vs 64 | 2200.36 ms | 27.05 ms | 81.35x |
-| hodograph, 64 curves x 4096 s (deg 8), 1 call vs 64 | 27.24 ms | 1.34 ms | 20.34x |
-| curvature, 64 curves x 4096 s (deg 8), 1 call vs 64 | 67.76 ms | 2.95 ms | 22.95x |
-| newton refine, 64 curves x 1024 points (deg 8), 1 call vs 65536 | 11473.13 ms | 5.72 ms | 2005.75x |
-| subdivide, 512 curves (deg 10), 1 call vs 512 | 23.20 ms | 0.21 ms | 108.40x |
-| specialize, 512 curves (deg 10), 1 call vs 512 | 155.25 ms | 0.38 ms | 409.84x |
-| elevate, 4096 curves (deg 8), 1 call vs 4096 | 50.24 ms | 0.19 ms | 270.18x |
-| length, 64 curves (deg 6), 1 call vs 64 | 1273.16 ms | 8.24 ms | 154.59x |
-| evaluate via Curve objects, 2048 x 256 s (deg 6) | 19.90 ms | 25.34 ms | **0.79x, slower** |
-| evaluate via curve_helpers (pure Python), 2048 x 256 s | 194.87 ms | 37.87 ms | 5.15x |
+| evaluate, 1 curve x 65536 s (deg 8) | 6.29 ms | 1.02 ms | 6.19x |
+| evaluate, 256 curves x 2048 s (deg 8), 1 call vs 256 | 87.47 ms | 1.32 ms | 66.10x |
+| evaluate (de Casteljau), 64 curves x 4096 s (deg 10), 1 call vs 64 | 2699.02 ms | 27.46 ms | 98.29x |
+| hodograph, 64 curves x 4096 s (deg 8), 1 call vs 64 | 30.02 ms | 1.24 ms | 24.20x |
+| curvature, 64 curves x 4096 s (deg 8), 1 call vs 64 | 72.11 ms | 2.69 ms | 26.77x |
+| newton refine, 64 curves x 1024 points (deg 8), 1 call vs 65536 | 11467.13 ms | 5.24 ms | 2189.46x |
+| subdivide, 512 curves (deg 10), 1 call vs 512 | 23.54 ms | 0.21 ms | 110.03x |
+| specialize, 512 curves (deg 10), 1 call vs 512 | 154.08 ms | 0.34 ms | 456.28x |
+| elevate, 4096 curves (deg 8), 1 call vs 4096 | 46.35 ms | 0.24 ms | 193.25x |
+| length, 64 curves (deg 6), 1 call vs 64 | 1134.21 ms | 7.82 ms | 145.02x |
+| evaluate via Curve objects, 2048 x 256 s (deg 6) | 19.89 ms | 22.77 ms | **0.87x, slower** |
+| evaluate via curve_helpers (pure Python), 2048 x 256 s | 200.94 ms | 40.04 ms | 5.02x |
 
 11 of 12 cases at or above upstream parity.
 
 | outputs (curves x s) | device | host SIMD | device/host |
 | ---: | ---: | ---: | ---: |
-| 262144 (1 x 131072 s) | 0.593 ms | 0.658 ms | 0.90 |
-| 131072 (8 x 8192 s) | 0.307 ms | 0.325 ms | 0.94 |
-| 524288 (32 x 8192 s) | 0.759 ms | 1.345 ms | 0.56 |
-| 1048576 (256 x 2048 s) | 1.277 ms | 2.712 ms | 0.47 |
-| 16777216 (1024 x 8192 s) | 107.137 ms | 113.592 ms | 0.94 |
+| 262144 (1 x 131072 s) | 0.598 ms | 0.623 ms | 0.96 |
+| 131072 (8 x 8192 s) | 0.302 ms | 0.329 ms | 0.92 |
+| 524288 (32 x 8192 s) | 0.762 ms | 1.313 ms | 0.58 |
+| 1048576 (256 x 2048 s) | 1.224 ms | 2.631 ms | 0.47 |
+| 16777216 (1024 x 8192 s) | 80.477 ms | 101.072 ms | 0.80 |
 ```
 
 ## Final gate
