@@ -76,7 +76,16 @@ def make_subdivision_matrices(degree: int):
     Returns:
         Tuple[numpy.ndarray, numpy.ndarray]: The left and right matrices, both
         ``(degree + 1, degree + 1)`` and Fortran ordered.
+
+    Raises:
+        ValueError: If ``degree`` is negative. Upstream's
+            ``make_subdivision_matrices`` indexes a zero-width array there
+            and raises ``IndexError``; the buffer the kernel writes into
+            would otherwise be zero-width and the write would land past it.
     """
+    degree = int(degree)
+    if degree < 0:
+        raise ValueError(f"degree must be non-negative, got {degree}")
     left, right = _lib.make_subdivision_matrices(degree)
     return np.asfortranarray(left), np.asfortranarray(right)
 

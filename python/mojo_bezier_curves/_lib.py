@@ -165,8 +165,15 @@ _MATRIX_CACHE: dict[int, tuple[np.ndarray, np.ndarray]] = {}
 
 
 def make_subdivision_matrices(degree: int) -> tuple[np.ndarray, np.ndarray]:
-    """The two subdivision matrices for `degree`, built once and reused."""
+    """The two subdivision matrices for `degree`, built once and reused.
+
+    Matches upstream ``make_subdivision_matrices``: a negative degree has
+    no matrices, and the kernel would otherwise write past a zero-width
+    buffer to build them.
+    """
     degree = int(degree)
+    if degree < 0:
+        raise ValueError(f"degree must be non-negative, got {degree}")
     cached = _MATRIX_CACHE.get(degree)
     if cached is not None:
         return cached
@@ -309,13 +316,18 @@ def elevate_nodes(nodes) -> np.ndarray:
 
 
 def de_casteljau_one_round(nodes, lambda1, lambda2) -> np.ndarray:
-    """One de Casteljau round, result ``(curves, dim, degree)``."""
+    """One de Casteljau round, result ``(curves, dim, degree)``.
+
+    Matches upstream ``de_casteljau_one_round``: a single node rounds to
+    an empty ``(dim, 0)`` array rather than raising, so degree 0 is the
+    empty result, not an error. The kernel already handles that case.
+    """
     curves = as_batch(nodes)
     num_curves, dim, width = curves.shape
     degree = width - 1
+    dst = np.empty((num_curves, dim, max(degree, 0)), dtype=np.float64)
     if degree < 1:
-        raise ValueError("a curve of degree 0 has no round to perform")
-    dst = np.empty((num_curves, dim, degree), dtype=np.float64)
+        return dst
     lib.bc_de_casteljau_one_round(
         _addr(curves), num_curves, dim, degree, ctypes.c_double(lambda1),
         ctypes.c_double(lambda2), _addr(dst),
